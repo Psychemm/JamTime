@@ -1,8 +1,8 @@
-// NAME: FreeJam
+// NAME: JamTime
 // AUTHOR: Psychemm
 // DESCRIPTION: Spotify Jam-style listening parties for free accounts. Everyone's Spotify plays the same song at the same time, with a shared queue.
 
-(async function FreeJam() {
+(async function JamTime() {
   while (!Spicetify?.Player?.data || !Spicetify.Topbar || !Spicetify.PopupModal || !Spicetify.ContextMenu) {
     await new Promise((r) => setTimeout(r, 300));
   }
@@ -15,8 +15,8 @@
 
   // ---------- settings ----------
   const store = {
-    get: (k, d) => Spicetify.LocalStorage.get(`freejam:${k}`) ?? d,
-    set: (k, v) => Spicetify.LocalStorage.set(`freejam:${k}`, v),
+    get: (k, d) => Spicetify.LocalStorage.get(`jamtime:${k}`) ?? d,
+    set: (k, v) => Spicetify.LocalStorage.set(`jamtime:${k}`, v),
   };
 
   // ---------- state ----------
@@ -34,7 +34,7 @@
   const pending = new Map();
   let nextId = 1;
 
-  const notify = (text, isError) => Spicetify.showNotification(`FreeJam: ${text}`, isError);
+  const notify = (text, isError) => Spicetify.showNotification(`JamTime: ${text}`, isError);
   const serverNow = () => Date.now() + clockOffset;
   const amHost = () => room && room.hostId === me;
   const canControl = () => room && (room.openControl || amHost());
@@ -274,7 +274,7 @@
         if (Math.abs(L.pos - expectedPos()) >= DRIFT_LIMIT) seekTo(expectedPos() + 0.2);
       }
     } catch (err) {
-      console.error('[FreeJam] could not apply room state', err);
+      console.error('[JamTime] could not apply room state', err);
     } finally {
       lastApply = Date.now();
       lastTick = null;
@@ -288,7 +288,7 @@
 
   // ---------- right-click menu ----------
   new Spicetify.ContextMenu.Item(
-    'Add to FreeJam queue',
+    'Add to JamTime queue',
     (uris) => request('add', { uris }).then((r) => notify(r.error || `Queued ${r.added}`, !!r.error)),
     (uris) => !!room && uris.every((u) => TRACK_URI.test(u)),
     'queue'
@@ -296,7 +296,7 @@
 
   // ---------- UI ----------
   const ICON = `<svg role="img" height="16" width="16" viewBox="0 0 16 16" fill="currentColor"><circle cx="4" cy="8" r="2.2"/><circle cx="12" cy="8" r="2.2"/><path d="M4 3.5a4.5 4.5 0 0 1 8 0l-1.2.7a3.1 3.1 0 0 0-5.6 0z"/><path d="M4 12.5a4.5 4.5 0 0 0 8 0l-1.2-.7a3.1 3.1 0 0 1-5.6 0z"/></svg>`;
-  const topbar = new Spicetify.Topbar.Button('FreeJam', ICON, openModal);
+  const topbar = new Spicetify.Topbar.Button('JamTime', ICON, openModal);
 
   let container = null;
 
@@ -339,7 +339,7 @@
   function openModal() {
     container = el('div', { className: 'fj' });
     renderUI();
-    Spicetify.PopupModal.display({ title: 'FreeJam', content: container, isLarge: true });
+    Spicetify.PopupModal.display({ title: 'JamTime', content: container, isLarge: true });
   }
 
   function renderUI() {
@@ -433,7 +433,7 @@
             if (ctl || t.addedById === me) btn('✕', 'Remove', () => sendCmd('remove', { id: t.id }));
             return trackRow(t, acts);
           }))
-        : el('div', { className: 'muted', textContent: 'Right-click any song in Spotify → "Add to FreeJam queue", or paste a link below.' }),
+        : el('div', { className: 'muted', textContent: 'Right-click any song in Spotify → "Add to JamTime queue", or paste a link below.' }),
       el('div', { className: 'row' }, link, el('button', { textContent: 'Add', onclick: addLink })),
 
       el('h3', { textContent: `Listening (${room.members.length})` }),

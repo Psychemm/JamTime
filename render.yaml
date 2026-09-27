@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: freejam
+    name: jamtime
     runtime: node
     plan: free
     buildCommand: npm install

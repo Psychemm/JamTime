@@ -1,4 +1,4 @@
-// FreeJam sync server. Keeps each room's "what's playing" state and shared
+// JamTime sync server. Keeps each room's "what's playing" state and shared
 // queue, and relays it to the Spicetify extension running in everyone's Spotify.
 const http = require('http');
 const crypto = require('crypto');
@@ -12,7 +12,7 @@ const END_GRACE = 4; // seconds from the end at which a track change counts as "
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end(`FreeJam server is running. ${rooms.size} room(s) open.\n`);
+  res.end(`JamTime server is running. ${rooms.size} room(s) open.\n`);
 });
 const wss = new WebSocketServer({ server });
 
@@ -341,5 +341,5 @@ setInterval(() => {
 }, 30_000);
 
 server.listen(PORT, () => {
-  console.log(`FreeJam server listening on port ${PORT}`);
+  console.log(`JamTime server listening on port ${PORT}`);
 });

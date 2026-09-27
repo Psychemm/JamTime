@@ -1,16 +1,27 @@
-# Installs the FreeJam extension into Spicetify and re-applies it.
+# Installs the JamTime extension into Spicetify.
+# Works from a clone of the repo, or straight from the web:
+#   iwr -useb https://raw.githubusercontent.com/Psychemm/JamTime/main/install.ps1 | iex
 $ErrorActionPreference = 'Stop'
+$RawUrl = 'https://raw.githubusercontent.com/Psychemm/JamTime/main/extension/jamtime.js'
 
 if (-not (Get-Command spicetify -ErrorAction SilentlyContinue)) {
-    Write-Error 'Spicetify is not installed. Get it from https://spicetify.app/docs/getting-started'
+    Write-Host 'Spicetify is not installed. Install it first:' -ForegroundColor Red
+    Write-Host '  iwr -useb https://raw.githubusercontent.com/spicetify/cli/main/install.ps1 | iex'
+    return
 }
 
-$userdata = (spicetify path userdata).Trim()
-$dest = Join-Path $userdata 'Extensions'
+$dest = Join-Path (spicetify path userdata).Trim() 'Extensions'
 New-Item -ItemType Directory -Force $dest | Out-Null
-Copy-Item (Join-Path $PSScriptRoot 'extension\freejam.js') $dest -Force
-Write-Host "Copied freejam.js to $dest"
+$target = Join-Path $dest 'jamtime.js'
 
-spicetify config extensions freejam.js
+$local = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'extension\jamtime.js' }
+if ($local -and (Test-Path $local)) {
+    Copy-Item $local $target -Force
+} else {
+    Invoke-WebRequest -UseBasicParsing $RawUrl -OutFile $target
+}
+Write-Host "Installed jamtime.js to $dest"
+
+spicetify config extensions jamtime.js
 spicetify apply
-Write-Host 'Done. Look for the FreeJam button in Spotify''s top bar.'
+Write-Host 'Done! Look for the JamTime button in the top bar of Spotify.' -ForegroundColor Green

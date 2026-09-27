@@ -1,5 +1,5 @@
 {
-  "name": "freejam",
+  "name": "jamtime",
   "version": "1.0.0",
   "description": "Spotify Jam-style listening parties for free accounts, via a Spicetify extension and a small sync server.",
   "main": "server.js",

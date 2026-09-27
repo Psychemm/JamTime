@@ -5,7 +5,7 @@ const vm = require('vm');
 const { spawn } = require('child_process');
 
 const ROOT = require('path').join(__dirname, '..');
-const src = fs.readFileSync(`${ROOT}/extension/freejam.js`, 'utf8');
+const src = fs.readFileSync(`${ROOT}/extension/jamtime.js`, 'utf8');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const X = 'spotify:track:4cOdK2wGLETKBW3PvgPWqT';
@@ -40,8 +40,8 @@ function makeClient(label, uri, posSec, playing) {
       showNotification: (t) => console.log(`  [${label} notif] ${t}`),
     },
   };
-  ls.set('freejam:server', 'ws://localhost:3999');
-  ls.set('freejam:name', label);
+  ls.set('jamtime:server', 'ws://localhost:3999');
+  ls.set('jamtime:name', label);
   // Expose internals for driving the test.
   const patched = src.replace('const topbar =', 'globalThis.__fj = { startOrJoin, toggle: () => request("toggleOpen"), get room() { return room; } };\n  const topbar =')
     .replace('if (inGrace) return;', 'if (DBG) console.log("  tick", LABEL, { synced, inGrace, sameTrack, lp: L.playing, rp: room.playing, pos: L.pos.toFixed(1), exp: exp.toFixed(1) }); if (inGrace) return;');
