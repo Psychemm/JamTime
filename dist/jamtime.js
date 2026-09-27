@@ -943,6 +943,14 @@
     try {
       topbar.active = !!session;
     } catch {}
+    // Redraw after the current click has finished. Replacing the clicked button
+    // mid-click makes Spotify think the click landed outside the popup and close it.
+    clearTimeout(renderTimer);
+    renderTimer = setTimeout(draw);
+  }
+
+  let renderTimer = null;
+  function draw() {
     if (!container || (!container.isConnected && container.childNodes.length)) return;
     const parts = session && room ? roomView() : lobbyView();
     container.replaceChildren(el('style', { textContent: CSS }), ...parts.filter(Boolean));
