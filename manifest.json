@@ -1,0 +1,11 @@
+[
+  {
+    "name": "JamTime",
+    "description": "Spotify Jam for free accounts. Start a jam, share the code, and everyone hears the same song at the same time with a shared queue. No server needed.",
+    "preview": "assets/preview.png",
+    "main": "dist/jamtime.js",
+    "readme": "README.md",
+    "authors": [{ "name": "Psychemm", "url": "https://github.com/Psychemm" }],
+    "tags": ["jam", "social", "party", "sync"]
+  }
+]

@@ -1,11 +1,10 @@
-// End-to-end sync test: runs the real extension code against mocked Spotify
-// players connected to a real server. Needs network access for track metadata.
+// End-to-end sync test: runs the real extension code in several mocked
+// Spotify clients connected through an in-memory fake of PeerJS.
 const fs = require('fs');
 const vm = require('vm');
-const { spawn } = require('child_process');
+const path = require('path');
 
-const ROOT = require('path').join(__dirname, '..');
-const src = fs.readFileSync(`${ROOT}/extension/jamtime.js`, 'utf8');
+const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'jamtime.js'), 'utf8');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const X = 'spotify:track:4cOdK2wGLETKBW3PvgPWqT';
@@ -13,10 +12,67 @@ const Y = 'spotify:track:0DiWol3AO6WpXZgp0goxAV';
 const Z = 'spotify:track:3n3Ppam7vgaVa1iaRUc9Lp';
 const W = 'spotify:track:7qiZfU4dY1lWllzX7mPBI3';
 
+// ---------- fake PeerJS ----------
+class Emitter {
+  constructor() { this._h = {}; }
+  on(e, f) { (this._h[e] ??= []).push(f); return this; }
+  once(e, f) { const w = (...a) => { this.off(e, w); f(...a); }; return this.on(e, w); }
+  off(e, f) { this._h[e] = (this._h[e] || []).filter((x) => x !== f); }
+  emit(e, ...a) { (this._h[e] || []).slice().forEach((f) => f(...a)); }
+}
+const registry = new Map();
+const peerError = (type) => Object.assign(new Error(type), { type });
+
+class Conn extends Emitter {
+  constructor() { super(); this.open = false; }
+  send(m) {
+    if (!this.open) return;
+    const data = JSON.parse(JSON.stringify(m));
+    setTimeout(() => this.other.open && this.other.emit('data', data), 2);
+  }
+  close() {
+    if (!this.open) return;
+    this.open = this.other.open = false;
+    setTimeout(() => { this.emit('close'); this.other.emit('close'); }, 2);
+  }
+}
+
+class MockPeer extends Emitter {
+  constructor(id) {
+    super();
+    this.id = typeof id === 'string' ? id : `anon-${Math.random()}`;
+    setTimeout(() => {
+      if (registry.has(this.id)) return this.emit('error', peerError('unavailable-id'));
+      registry.set(this.id, this);
+      this.emit('open', this.id);
+    }, 5);
+  }
+  connect(id) {
+    const a = new Conn(), b = new Conn();
+    a.other = b; b.other = a;
+    setTimeout(() => {
+      const host = registry.get(id);
+      if (!host) return this.emit('error', peerError('peer-unavailable'));
+      a.open = b.open = true;
+      host.emit('connection', b);
+      a.emit('open');
+      b.emit('open');
+    }, 5);
+    return a;
+  }
+  reconnect() {}
+  destroy() {
+    this.destroyed = true;
+    if (registry.get(this.id) === this) registry.delete(this.id);
+  }
+}
+
+// ---------- fake Spotify ----------
 function makeClient(label, uri, posSec, playing) {
   const p = { uri, pos: posSec * 1000, playing, at: Date.now(), dur: 200000 };
   const progress = () => Math.min(p.dur, p.pos + (p.playing ? Date.now() - p.at : 0));
   const freeze = () => ((p.pos = progress()), (p.at = Date.now()));
+  const notifications = [];
   const Player = {
     get data() { return { item: { uri: p.uri, name: 'Song ' + p.uri.slice(-4), artists: [{ name: 'Artist' }], images: [] } }; },
     getProgress: progress,
@@ -28,112 +84,109 @@ function makeClient(label, uri, posSec, playing) {
     playUri: async (u) => { await sleep(150); p.uri = u; p.pos = 0; p.at = Date.now(); p.playing = true; },
     addEventListener() {},
   };
-  const ls = new Map();
   const ctx = {
-    console, setTimeout, setInterval, clearTimeout, WebSocket, Promise, Date, Math, JSON,
+    console: { ...console, warn() {} }, setTimeout, setInterval, clearTimeout, clearInterval, Promise, Date, Math, JSON,
+    Peer: MockPeer,
+    window: { addEventListener() {} },
     Spicetify: {
       Player,
-      Topbar: { Button: class { constructor(l, i, cb) { ctx.openModal = cb; } } },
+      Topbar: { Button: class {} },
       PopupModal: { display() {} },
       ContextMenu: { Item: class { register() {} } },
-      LocalStorage: { get: (k) => ls.get(k) ?? null, set: (k, v) => ls.set(k, v) },
-      showNotification: (t) => console.log(`  [${label} notif] ${t}`),
+      Platform: { UserAPI: { getUser: async () => ({ displayName: label }) } },
+      CosmosAsync: {
+        get: async (url) => ({
+          tracks: url.split('ids=')[1].split(',').map((id) => ({
+            uri: `spotify:track:${id}`, name: `Track ${id.slice(-4)}`, artists: [{ name: 'Band' }],
+            album: { images: [{ url: 'https://i.scdn.co/image/x' }] }, duration_ms: 180000,
+          })),
+        }),
+      },
+      showNotification: (t) => notifications.push(t),
     },
   };
-  ls.set('jamtime:server', 'ws://localhost:3999');
-  ls.set('jamtime:name', label);
-  // Expose internals for driving the test.
-  const patched = src.replace('const topbar =', 'globalThis.__fj = { startOrJoin, toggle: () => request("toggleOpen"), get room() { return room; } };\n  const topbar =')
-    .replace('if (inGrace) return;', 'if (DBG) console.log("  tick", LABEL, { synced, inGrace, sameTrack, lp: L.playing, rp: room.playing, pos: L.pos.toFixed(1), exp: exp.toFixed(1) }); if (inGrace) return;');
-  ctx.DBG = !!process.env.DBG; ctx.LABEL = label;
+  // Expose internals so the test can drive them.
+  const patched = src.replace(
+    'const topbar =',
+    'globalThis.__jt = { start, addSongs, endSession, get room() { return room; }, get session() { return session; } };\n  const topbar ='
+  );
   vm.runInNewContext(patched, ctx);
-  return { p, progress, ctx, api: () => ctx.__fj };
+  return { p, progress, player: Player, notifications, api: () => ctx.__jt };
 }
 
-const show = (c, label) =>
-  `${label}: ${c.p.uri.slice(-4)} ${c.p.playing ? '▶' : '⏸'} ${(c.progress() / 1000).toFixed(1)}s`;
+const show = (c, label) => `${label}: ${c.p.uri.slice(-4)} ${c.p.playing ? '▶' : '⏸'} ${(c.progress() / 1000).toFixed(1)}s`;
 
 (async () => {
-  const srv = spawn(process.execPath, [`${ROOT}/server.js`], { env: { ...process.env, PORT: '3999' }, stdio: 'inherit' });
-  await sleep(800);
   let fails = 0;
-  const check = (name, cond) => { console.log(`${cond ? 'PASS' : 'FAIL'} ${name}`); if (!cond) fails++; };
+  const check = (name, cond, ...info) => {
+    console.log(`${cond ? 'PASS' : 'FAIL'} ${name}${cond ? '' : '  ' + info.join(' ')}`);
+    if (!cond) fails++;
+  };
   const close = (a, b) => Math.abs(a.progress() - b.progress()) < 2500;
 
-  try {
-    const A = makeClient('A', X, 30, true);
-    const B = makeClient('B', Y, 0, true);
-    await sleep(500);
+  const A = makeClient('Alice', X, 30, true);
+  const B = makeClient('Bob', Y, 0, true);
+  const C = makeClient('Cara', Y, 0, false);
+  await sleep(500);
 
-    await A.api().startOrJoin();
-    await sleep(1500);
-    const code = A.api().room.code;
-    check('host song becomes jam song', A.api().room.current?.uri === X);
+  await A.api().start();
+  await sleep(1500);
+  const code = A.api().room?.code;
+  check('host song becomes jam song', A.api().room?.current?.uri === X);
 
-    await B.api().startOrJoin(code);
-    await sleep(2500);
-    console.log(' ', show(A, 'A'), '|', show(B, 'B'));
-    check('guest switches to host song', B.p.uri === X && close(A, B) && B.p.playing);
+  await B.api().start('ZZZZZ');
+  check('bad code gives a clear error', !B.api().session);
 
-    await sleep(3500); // let grace periods pass
-    A.ctx.Spicetify.Player.pause();
-    await sleep(2500);
-    console.log(' ', show(A, 'A'), '|', show(B, 'B'));
-    check('host pause reaches guest', !B.p.playing && !A.p.playing);
+  await B.api().start(code);
+  await sleep(2500);
+  check('guest switches to host song', B.p.uri === X && close(A, B) && B.p.playing, show(A, 'A'), show(B, 'B'));
+  check('names come from Spotify', A.api().room.members.map((m) => m.name).join() === 'Alice,Bob');
 
-    await sleep(3500);
-    A.ctx.Spicetify.Player.play();
-    A.ctx.Spicetify.Player.seek(100000);
-    await sleep(2500);
-    console.log(' ', show(A, 'A'), '|', show(B, 'B'));
-    check('host play+seek reaches guest', B.p.playing && B.progress() > 98000 && close(A, B));
+  await sleep(3500); // let grace periods pass
+  A.player.pause();
+  await sleep(2500);
+  check('host pause reaches guest', !B.p.playing && !A.p.playing, show(A, 'A'), show(B, 'B'));
 
-    await sleep(3500);
-    await B.ctx.Spicetify.Player.playUri(Z);
-    await sleep(2500);
-    console.log(' ', show(A, 'A'), '|', show(B, 'B'));
-    check('guest picking a song moves everyone (open control)', A.p.uri === Z && B.p.uri === Z && close(A, B));
+  await sleep(3500);
+  A.player.play();
+  A.player.seek(100000);
+  await sleep(2500);
+  check('host play+seek reaches guest', B.p.playing && B.progress() > 98000 && close(A, B), show(A, 'A'), show(B, 'B'));
 
-    const r = await new Promise((res) => {
-      const ws = new WebSocket('ws://localhost:3999');
-      ws.onopen = () => ws.send(JSON.stringify({ t: 'join', id: 1, code, name: 'C' }));
-      ws.onmessage = (e) => {
-        const m = JSON.parse(e.data);
-        if (m.id === 1) ws.send(JSON.stringify({ t: 'add', id: 2, uris: [W] }));
-        if (m.id === 2) { ws.close(); res(m); }
-      };
-    });
-    console.log('  add ->', JSON.stringify(r));
-    await sleep(500);
-    check('queued song has metadata', A.api().room.queue[0]?.uri === W && A.api().room.queue[0].name !== 'Unknown track');
+  await sleep(3500);
+  await B.player.playUri(Z);
+  await sleep(2500);
+  check('guest picking a song moves everyone', A.p.uri === Z && B.p.uri === Z && close(A, B), show(A, 'A'), show(B, 'B'));
 
-    await sleep(3000);
-    // Simulate Spotify autoplay at the end of the song on the host: queue should win.
-    A.p.pos = 198500; A.p.at = Date.now(); B.p.pos = 198500; B.p.at = Date.now();
-    await new Promise((res) => {
-      const ws = new WebSocket('ws://localhost:3999');
-      ws.onopen = () => ws.send(JSON.stringify({ t: 'join', id: 1, code, name: 'D' }));
-      ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id === 1) { ws.send(JSON.stringify({ t: 'seek', id: 2, pos: 198.5 })); } if (m.id === 2) { ws.close(); res(); } };
-    });
-    await sleep(3500);
-    console.log(' ', show(A, 'A'), '|', show(B, 'B'));
-    check('queue advances at end of song', A.p.uri === W && B.p.uri === W);
+  await B.api().addSongs(['https://open.spotify.com/track/7qiZfU4dY1lWllzX7mPBI3?si=abc']);
+  await sleep(300);
+  const q = A.api().room.queue[0];
+  check('guest adds a song by link, with metadata', q?.uri === W && q.name === 'Track PBI3' && q.addedBy === 'Bob');
 
-    // Host-only mode: a guest's own changes get reverted.
-    await new Promise((res) => {
-      const s = new WebSocket('ws://localhost:3999');
-      s.onopen = () => s.send(JSON.stringify({ t: 'join', id: 1, code, name: 'E' }));
-      s.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id === 1) { s.close(); res(); } };
-    });
-    await A.api().toggle();
-    await sleep(3500);
-    B.ctx.Spicetify.Player.pause();
-    await sleep(2500);
-    console.log(' ', show(A, 'A'), '|', show(B, 'B'), 'open:', A.api().room.openControl);
-    check('host-only: guest pause is reverted', !A.api().room.openControl && A.p.playing && B.p.playing && close(A, B));
-  } finally {
-    srv.kill();
-    console.log(fails ? `${fails} FAILED` : 'ALL PASSED');
-    process.exit(fails ? 1 : 0);
-  }
+  await C.api().start(code);
+  await sleep(2500);
+  check('late joiner syncs up', C.p.uri === Z && C.p.playing && close(A, C), show(A, 'A'), show(C, 'C'));
+
+  await sleep(3500);
+  A.player.seek(198500); // host skips to the end of the song
+  await sleep(6000);
+  check('queue advances at end of song', [A, B, C].every((c) => c.p.uri === W), show(A, 'A'), show(B, 'B'), show(C, 'C'));
+
+  await A.api().session.request('toggleOpen');
+  await sleep(3500);
+  B.player.pause();
+  await sleep(2500);
+  check('host-only: guest pause is reverted', !A.api().room.openControl && B.p.playing && close(A, B), show(A, 'A'), show(B, 'B'));
+  check('guest told they cannot control', B.notifications.some((n) => n.includes('Only the host')));
+
+  C.api().endSession();
+  await sleep(300);
+  check('guest leaving updates members', A.api().room.members.length === 2);
+
+  A.api().endSession();
+  await sleep(300);
+  check('host ending the jam ends it for guests', !B.api().session && B.notifications.some((n) => n.includes('ended')));
+
+  console.log(fails ? `${fails} FAILED` : 'ALL PASSED');
+  process.exit(fails ? 1 : 0);
 })();
