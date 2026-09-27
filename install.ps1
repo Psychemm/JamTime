@@ -38,6 +38,9 @@ if ($local -and (Test-Path $local)) {
     Invoke-WebRequest -UseBasicParsing $RawUrl -OutFile $target
 }
 
+# Spicetify prints progress to stderr, which some PowerShell hosts treat as
+# errors; don't let that abort the install.
+$ErrorActionPreference = 'Continue'
 & $spicetify config extensions jamtime.js | Out-Null
 Write-Host 'Applying to Spotify (it will restart)...' -ForegroundColor Cyan
 & $spicetify apply
