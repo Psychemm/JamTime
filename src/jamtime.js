@@ -1,8 +1,8 @@
 // JamTime: Spotify Jam-style listening parties for free accounts.
 //
-// No server: the host's Spotify runs the jam, and guests connect to it
-// directly over WebRTC (PeerJS). The public PeerJS broker is only used to
-// find each other by jam code.
+// No server of our own: the host's Spotify runs the jam, and guests talk to
+// it through free public MQTT brokers (small JSON messages), so it works
+// between any two networks.
 //
 //   host Spotify ── Room (state, queue, clock) ──┬── guest Spotify
 //                                                └── guest Spotify
@@ -17,7 +17,10 @@
 
   const Player = Spicetify.Player;
   const TRACK_URI = /^spotify:track:[A-Za-z0-9]{22}$/;
-  const PEER_PREFIX = 'jamtime-v1-';
+  // Free public MQTT brokers used as message relays. The host listens on all
+  // of them; a guest uses the first one that reaches the host.
+  const RELAYS = ['wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081'];
+  const TOPIC_PREFIX = 'jamtime/v2/';
   const DRIFT_LIMIT = 2.5; // seconds out of sync before we correct
   const APPLY_GRACE = 3000; // ms to ignore local changes after we change the player ourselves
   const END_GRACE = 4; // seconds from the end at which a track change counts as "song finished"
@@ -277,7 +280,7 @@
   }
 
   // =====================================================================
-  // Connection: host (runs a Room) or guest (talks to the host over WebRTC)
+  // Connection: host (runs a Room) or guest (talks to the host via a relay)
   // =====================================================================
   let session = null; // { role, code, request(t, body), close() }
   let room = null; // latest room state (a 'state' message)
@@ -311,53 +314,223 @@
     }
   }
 
-  // Open a PeerJS peer, resolving once it's registered with the broker.
-  function openPeer(id) {
+  // ---------- minimal MQTT 3.1.1 client over WebSocket (QoS 0 only) ----------
+  function mqttConnect(url) {
     return new Promise((resolve, reject) => {
-      const peer = id ? new Peer(id, { debug: 0 }) : new Peer({ debug: 0 });
-      const timer = setTimeout(() => (peer.destroy(), reject(new Error('Could not reach the matchmaking service'))), 15000);
-      peer.once('open', () => (clearTimeout(timer), resolve(peer)));
-      peer.once('error', (err) => (clearTimeout(timer), peer.destroy(), reject(err)));
+      const enc = new TextEncoder();
+      const dec = new TextDecoder();
+      let ws;
+      try {
+        ws = new WebSocket(url, 'mqtt');
+      } catch (err) {
+        return reject(err);
+      }
+      ws.binaryType = 'arraybuffer';
+      let buf = new Uint8Array(0);
+      let ready = false;
+      let pinger = null;
+      let nextPid = 1;
+      const subacks = new Map();
+
+      const mqttStr = (s) => {
+        const b = enc.encode(s);
+        return [b.length >> 8, b.length & 255, ...b];
+      };
+      function send(header, body) {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const len = [];
+        let n = body.length;
+        do {
+          let digit = n % 128;
+          n = Math.floor(n / 128);
+          if (n > 0) digit |= 128;
+          len.push(digit);
+        } while (n > 0);
+        const packet = new Uint8Array(1 + len.length + body.length);
+        packet[0] = header;
+        packet.set(len, 1);
+        packet.set(body, 1 + len.length);
+        ws.send(packet);
+      }
+
+      const client = {
+        url,
+        closed: false,
+        onMessage: () => {},
+        onClose: () => {},
+        subscribe(topic) {
+          const pid = nextPid++ & 0xffff || nextPid++;
+          send(0x82, [pid >> 8, pid & 255, ...mqttStr(topic), 0]);
+          return new Promise((res) => {
+            subacks.set(pid, res);
+            setTimeout(() => subacks.delete(pid) && res(), 5000);
+          });
+        },
+        publish(topic, obj) {
+          const payload = enc.encode(JSON.stringify(obj));
+          const t = mqttStr(topic);
+          const body = new Uint8Array(t.length + payload.length);
+          body.set(t);
+          body.set(payload, t.length);
+          send(0x30, body);
+        },
+        close() {
+          client.closed = true;
+          clearInterval(pinger);
+          try {
+            send(0xe0, []);
+            ws.close();
+          } catch {}
+        },
+      };
+
+      function handle(header, body) {
+        const type = header >> 4;
+        if (type === 2) {
+          // CONNACK
+          if (body[1] !== 0) return reject(new Error('Relay refused the connection'));
+          ready = true;
+          pinger = setInterval(() => send(0xc0, []), 20000);
+          resolve(client);
+        } else if (type === 3) {
+          // PUBLISH
+          const qos = (header >> 1) & 3;
+          const tlen = (body[0] << 8) | body[1];
+          const topic = dec.decode(body.subarray(2, 2 + tlen));
+          const payload = body.subarray(2 + tlen + (qos ? 2 : 0));
+          let msg;
+          try {
+            msg = JSON.parse(dec.decode(payload));
+          } catch {
+            return;
+          }
+          client.onMessage(topic, msg);
+        } else if (type === 9) {
+          // SUBACK
+          const pid = (body[0] << 8) | body[1];
+          subacks.get(pid)?.();
+          subacks.delete(pid);
+        }
+      }
+
+      ws.onopen = () => send(0x10, [...mqttStr('MQTT'), 4, 2, 0, 60, ...mqttStr('jt' + uid().slice(0, 20))]);
+      ws.onmessage = (e) => {
+        const d = new Uint8Array(e.data);
+        const merged = new Uint8Array(buf.length + d.length);
+        merged.set(buf);
+        merged.set(d, buf.length);
+        buf = merged;
+        // A WebSocket frame can hold several MQTT packets, or part of one.
+        for (;;) {
+          if (buf.length < 2) return;
+          let len = 0;
+          let mult = 1;
+          let i = 1;
+          let byte;
+          do {
+            if (i >= buf.length) return;
+            byte = buf[i++];
+            len += (byte & 127) * mult;
+            mult *= 128;
+          } while (byte & 128);
+          if (buf.length < i + len) return;
+          const header = buf[0];
+          const body = buf.slice(i, i + len);
+          buf = buf.slice(i + len);
+          handle(header, body);
+        }
+      };
+      ws.onerror = () => !ready && reject(new Error('Relay unreachable'));
+      ws.onclose = () => {
+        clearInterval(pinger);
+        if (!ready) reject(new Error('Relay unreachable'));
+        else if (!client.closed) client.onClose();
+      };
+      setTimeout(() => {
+        if (ready) return;
+        reject(new Error('Relay timed out'));
+        try {
+          ws.close();
+        } catch {}
+      }, 8000);
     });
   }
 
-  async function hostJam() {
-    let peer;
-    let code;
-    for (let attempt = 0; !peer; attempt++) {
-      code = newCode();
-      try {
-        peer = await openPeer(PEER_PREFIX + code);
-      } catch (err) {
-        if (err.type !== 'unavailable-id' || attempt > 3) throw err;
-      }
+  // A relay connection that stays subscribed to one topic and reconnects
+  // by itself if it drops.
+  function relayLink(url, topic, onMessage) {
+    const link = {
+      url,
+      client: null,
+      closed: false,
+      publish: (t, obj) => link.client?.publish(t, obj),
+      close() {
+        link.closed = true;
+        link.client?.close();
+      },
+    };
+    async function open() {
+      const c = await mqttConnect(url);
+      if (link.closed) return c.close();
+      c.onMessage = (t, msg) => onMessage(link, msg);
+      c.onClose = () => {
+        link.client = null;
+        retry();
+      };
+      await c.subscribe(topic);
+      link.client = c;
     }
+    function retry() {
+      if (!link.closed) setTimeout(() => open().catch(retry), 3000);
+    }
+    link.retry = retry;
+    link.ready = open();
+    return link;
+  }
 
+  const CONNECT_ERROR = 'Could not connect. Check your internet connection.';
+
+  async function hostJam() {
+    const code = newCode();
+    const base = TOPIC_PREFIX + code;
     const jam = createRoom(code);
+
+    const onGuestMessage = (link, msg) => {
+      if (!msg || typeof msg !== 'object' || typeof msg.from !== 'string' || msg.from.length > 40) return;
+      const reply = (body) => msg.id != null && link.publish(`${base}/g/${msg.from}`, { t: 'ack', id: msg.id, ...body });
+      let member = jam.state.members.get(msg.from);
+      if (msg.t === 'join') {
+        if (!member) {
+          member = { id: msg.from, lastSeen: Date.now() };
+          member.send = (m) => member.link.publish(`${base}/g/${member.id}`, m);
+        }
+        member.link = link;
+        jam.join(member, msg.name);
+        return reply({ you: member.id, code });
+      }
+      if (!member) return reply({ error: 'Not in the jam' });
+      member.link = link;
+      if (msg.t === 'leave') {
+        jam.leave(member.id);
+        return reply({});
+      }
+      reply(jam.handle(member, msg));
+    };
+
+    // Listen on every relay so guests can use whichever one they reach.
+    const links = RELAYS.map((url) => relayLink(url, `${base}/h`, onGuestMessage));
+    const results = await Promise.allSettled(links.map((l) => l.ready));
+    if (!results.some((r) => r.status === 'fulfilled')) {
+      links.forEach((l) => l.close());
+      throw new Error(CONNECT_ERROR);
+    }
+    // Relays that failed keep retrying in the background.
+    links.forEach((l, i) => results[i].status === 'rejected' && l.retry());
+
     const self = { id: uid(), send: (msg) => setTimeout(() => onMessage(msg)) };
     me = self.id;
     clockOffset = 0;
     jam.join(self, await myName());
-
-    peer.on('connection', (conn) => {
-      const member = { id: uid(), name: 'Guest', lastSeen: Date.now(), close: () => conn.close() };
-      member.send = (msg) => conn.open && conn.send(msg);
-      conn.on('data', (msg) => {
-        if (!msg || typeof msg !== 'object') return;
-        const reply = (body) => msg.id != null && conn.open && conn.send({ t: 'ack', id: msg.id, ...body });
-        if (msg.t === 'join') {
-          jam.join(member, msg.name);
-          return reply({ you: member.id, code });
-        }
-        if (!jam.state.members.has(member.id)) return reply({ error: 'Not in the jam' });
-        reply(jam.handle(member, msg));
-      });
-      conn.on('close', () => jam.leave(member.id));
-      conn.on('error', () => jam.leave(member.id));
-    });
-    // Losing the broker only stops new people from joining; keep trying.
-    peer.on('disconnected', () => setTimeout(() => !peer.destroyed && peer.reconnect(), 3000));
-    peer.on('error', (err) => console.warn('[JamTime] peer error', err.type));
 
     const sweeper = setInterval(() => jam.sweep(), HEARTBEAT_MS);
     session = {
@@ -368,49 +541,57 @@
       close() {
         clearInterval(sweeper);
         jam.end();
-        setTimeout(() => peer.destroy(), 300); // let the "ended" message go out
+        setTimeout(() => links.forEach((l) => l.close()), 500); // let "ended" go out
       },
     };
     return code;
   }
 
   async function joinJam(code) {
-    const peer = await openPeer();
-    const conn = peer.connect(PEER_PREFIX + code, { reliable: true, serialization: 'json' });
-
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('No jam found with that code')), 12000);
-      conn.once('open', () => (clearTimeout(timer), resolve()));
-      peer.once('error', (err) => {
-        clearTimeout(timer);
-        reject(err.type === 'peer-unavailable' ? new Error('No jam found with that code') : err);
-      });
-    }).catch((err) => {
-      peer.destroy();
-      throw err;
-    });
-
+    const base = TOPIC_PREFIX + code;
+    const myId = uid();
     const pending = new Map();
     let nextId = 1;
     let lastHeard = Date.now();
+    let link = null;
 
-    conn.on('data', (msg) => {
+    const onHostMessage = (_link, msg) => {
       lastHeard = Date.now();
       if (msg?.t === 'ack') {
         pending.get(msg.id)?.(msg);
         pending.delete(msg.id);
-      } else if (msg) onMessage(msg);
-    });
-    conn.on('close', () => endSession('Lost connection to the jam'));
+      } else if (msg && typeof msg === 'object') onMessage(msg);
+    };
 
-    const request = (t, body = {}) =>
+    const request = (t, body = {}, timeout = 10000) =>
       new Promise((resolve) => {
-        if (!conn.open) return resolve({ error: 'Not connected' });
+        if (!link?.client) return resolve({ error: 'Not connected' });
         const id = nextId++;
         pending.set(id, resolve);
-        conn.send({ t, id, ...body });
-        setTimeout(() => pending.delete(id) && resolve({ error: 'The host did not respond' }), 10000);
+        link.publish(`${base}/h`, { t, id, from: myId, ...body });
+        setTimeout(() => pending.delete(id) && resolve({ error: 'The host did not respond' }), timeout);
       });
+
+    // Try each relay until the host answers on one of them.
+    const name = await myName();
+    let reached = false;
+    let res = null;
+    for (const url of RELAYS) {
+      const l = relayLink(url, `${base}/g/${myId}`, onHostMessage);
+      try {
+        await l.ready;
+      } catch {
+        l.close();
+        continue;
+      }
+      reached = true;
+      link = l;
+      res = await request('join', { name }, 6000);
+      if (!res.error) break;
+      l.close();
+      link = null;
+    }
+    if (!link) throw new Error(reached ? 'No jam found with that code. Check the code, and make sure the host still has the jam open.' : CONNECT_ERROR);
 
     const heartbeat = setInterval(() => {
       if (Date.now() - lastHeard > TIMEOUT_MS) return endSession('Lost connection to the jam');
@@ -423,17 +604,10 @@
       request,
       close() {
         clearInterval(heartbeat);
-        conn.close();
-        peer.destroy();
+        link.publish(`${base}/h`, { t: 'leave', from: myId });
+        setTimeout(() => link.close(), 300);
       },
     };
-
-    const res = await request('join', { name: await myName() });
-    if (res.error) {
-      session.close();
-      session = null;
-      throw new Error(res.error);
-    }
     me = res.you;
     await syncClock();
   }
@@ -472,11 +646,7 @@
       }
     } catch (err) {
       console.warn('[JamTime]', err);
-      const msg =
-        err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error'
-          ? 'Could not connect. Check your internet connection.'
-          : err.message || 'Something went wrong';
-      renderUI(null, msg);
+      renderUI(null, err.message || 'Something went wrong');
       busy = false;
       return;
     }

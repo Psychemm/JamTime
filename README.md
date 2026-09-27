@@ -4,7 +4,7 @@
 
 ![JamTime](assets/preview.png)
 
-Everything happens inside Spotify. There's no server to run and no account to make.
+Everything happens inside Spotify. There's no server to run and no account to make, and it works between any two internet connections.
 
 ---
 
@@ -49,13 +49,14 @@ The jam ends when the host clicks **End jam** or closes Spotify, just like Spoti
 - **Ads (free accounts):** an ad knocks you out of sync for a moment, and JamTime catches you up when it ends.
 - **Songs only:** podcasts and local files aren't synced.
 - **Following the jam** replaces whatever your Spotify was playing.
+- **Privacy:** jam messages (song names, display names, the jam code) pass through free public relay servers, which anyone who knows or guesses a code could also read.
 - **Spotify's terms:** Spicetify modifies the Spotify app, which Spotify's terms technically don't allow. Lots of people use it, but it's at your own risk.
 
 ## Troubleshooting
 
 - **No JamTime button:** Spotify probably updated itself. Paste the install command again.
 - **"No jam found with that code":** check the code, and make sure the host still has Spotify open.
-- **Can't connect:** very strict networks (some schools and offices) block peer-to-peer connections. Try another network or a phone hotspot.
+- **"Could not connect":** some strict networks (schools, offices) block the relay's port. Try another network or a phone hotspot.
 
 ## Uninstall
 
@@ -68,12 +69,12 @@ spicetify apply
 
 ## How it works
 
-There's no JamTime server. The host's Spotify runs the jam, and guests connect straight to it peer-to-peer over WebRTC. [PeerJS](https://peerjs.com)'s free public service is only used to find each other by code.
+There's no JamTime server. The host's Spotify runs the jam, and everyone swaps small messages through free public MQTT relays ([EMQX](https://www.emqx.com/en/mqtt/public-mqtt5-broker) and [Mosquitto](https://test.mosquitto.org)). The host listens on both, and each guest uses whichever relay reaches the host.
 
 ```
-            ┌──────── guest Spotify
-host Spotify ─────────── guest Spotify        (direct WebRTC connections)
-(runs the jam)└──────── guest Spotify
+host Spotify ──┐                      ┌── guest Spotify
+(runs the jam) ├── public MQTT relay ─┤
+               │   (EMQX / Mosquitto) └── guest Spotify
 ```
 
 - The **host** keeps the jam's state: current song, play/pause, position and queue. Guests sync their clocks to the host's.
@@ -85,9 +86,9 @@ host Spotify ─────────── guest Spotify        (direct WebR
 
 ```bash
 npm install
-npm run build   # bundles src/jamtime.js + PeerJS into dist/jamtime.js
-npm test        # end-to-end sync test: several fake Spotifys, in-memory network
+npm run build   # builds dist/jamtime.js from src/jamtime.js
+npm test        # end-to-end sync test: several fake Spotifys, in-memory fake relays
 ```
 
-- **`test/browser.html`:** runs two fake Spotifys with the real bundle over real WebRTC. Serve the repo over http and open it.
+- **`test/browser.html`:** runs two fake Spotifys with the real build over the real relays. Serve the repo over http and open it.
 - **Trying changes in Spotify:** copy `dist/jamtime.js` into your Spicetify Extensions folder and run `spicetify apply`.

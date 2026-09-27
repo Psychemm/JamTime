@@ -1,7 +1,7 @@
 {
   "name": "jamtime",
-  "version": "2.0.0",
-  "description": "Spotify Jam for free accounts. A Spicetify extension, peer-to-peer, no server needed.",
+  "version": "2.1.0",
+  "description": "Spotify Jam for free accounts. A Spicetify extension with no server of its own.",
   "scripts": {
     "build": "node build.js",
     "test": "node test/sync.test.js"
@@ -15,8 +15,5 @@
     "jam",
     "listening-party"
   ],
-  "devDependencies": {
-    "peerjs": "^1.5.5"
-  },
   "private": true
 }

@@ -1,5 +1,5 @@
 // End-to-end sync test: runs the real extension code in several mocked
-// Spotify clients connected through an in-memory fake of PeerJS.
+// Spotify clients connected through in-memory fake MQTT relays.
 const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
@@ -12,58 +12,49 @@ const Y = 'spotify:track:0DiWol3AO6WpXZgp0goxAV';
 const Z = 'spotify:track:3n3Ppam7vgaVa1iaRUc9Lp';
 const W = 'spotify:track:7qiZfU4dY1lWllzX7mPBI3';
 
-// ---------- fake PeerJS ----------
-class Emitter {
-  constructor() { this._h = {}; }
-  on(e, f) { (this._h[e] ??= []).push(f); return this; }
-  once(e, f) { const w = (...a) => { this.off(e, w); f(...a); }; return this.on(e, w); }
-  off(e, f) { this._h[e] = (this._h[e] || []).filter((x) => x !== f); }
-  emit(e, ...a) { (this._h[e] || []).slice().forEach((f) => f(...a)); }
-}
-const registry = new Map();
-const peerError = (type) => Object.assign(new Error(type), { type });
+// ---------- fake MQTT broker (in memory, one per relay URL) ----------
+const subs = new Map(); // "url|topic" -> Set<FakeWS>
+const brokerDown = new Set(); // relay URLs that refuse new connections
 
-class Conn extends Emitter {
-  constructor() { super(); this.open = false; }
-  send(m) {
-    if (!this.open) return;
-    const data = JSON.parse(JSON.stringify(m));
-    setTimeout(() => this.other.open && this.other.emit('data', data), 2);
+class FakeWS {
+  static OPEN = 1;
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.keys = new Set();
+    setTimeout(() => {
+      if (brokerDown.has(url)) return this.onerror?.(), this.onclose?.();
+      this.readyState = 1;
+      this.onopen?.();
+    }, 5);
+  }
+  send(packet) {
+    const b = Buffer.from(packet);
+    const type = b[0] >> 4;
+    let i = 1, len = 0, mult = 1, byte;
+    do { byte = b[i++]; len += (byte & 127) * mult; mult *= 128; } while (byte & 128);
+    const body = b.subarray(i, i + len);
+    if (type === 1) this.deliver([0x20, 2, 0, 0]); // CONNECT -> CONNACK
+    else if (type === 8) { // SUBSCRIBE -> SUBACK
+      const key = this.url + '|' + body.subarray(4, 4 + body.readUInt16BE(2)).toString();
+      if (!subs.has(key)) subs.set(key, new Set());
+      subs.get(key).add(this);
+      this.keys.add(key);
+      this.deliver([0x90, 3, body[0], body[1], 0]);
+    } else if (type === 3) { // PUBLISH -> forward to subscribers
+      const key = this.url + '|' + body.subarray(2, 2 + body.readUInt16BE(0)).toString();
+      for (const ws of subs.get(key) || []) ws.deliver(b);
+    } else if (type === 14) this.close();
+  }
+  deliver(bytes) {
+    const data = new Uint8Array(bytes).buffer;
+    setTimeout(() => this.readyState === 1 && this.onmessage?.({ data }), 2);
   }
   close() {
-    if (!this.open) return;
-    this.open = this.other.open = false;
-    setTimeout(() => { this.emit('close'); this.other.emit('close'); }, 2);
-  }
-}
-
-class MockPeer extends Emitter {
-  constructor(id) {
-    super();
-    this.id = typeof id === 'string' ? id : `anon-${Math.random()}`;
-    setTimeout(() => {
-      if (registry.has(this.id)) return this.emit('error', peerError('unavailable-id'));
-      registry.set(this.id, this);
-      this.emit('open', this.id);
-    }, 5);
-  }
-  connect(id) {
-    const a = new Conn(), b = new Conn();
-    a.other = b; b.other = a;
-    setTimeout(() => {
-      const host = registry.get(id);
-      if (!host) return this.emit('error', peerError('peer-unavailable'));
-      a.open = b.open = true;
-      host.emit('connection', b);
-      a.emit('open');
-      b.emit('open');
-    }, 5);
-    return a;
-  }
-  reconnect() {}
-  destroy() {
-    this.destroyed = true;
-    if (registry.get(this.id) === this) registry.delete(this.id);
+    if (this.readyState !== 1) return;
+    this.readyState = 3;
+    for (const k of this.keys) subs.get(k)?.delete(this);
+    setTimeout(() => this.onclose?.(), 2);
   }
 }
 
@@ -86,7 +77,7 @@ function makeClient(label, uri, posSec, playing) {
   };
   const ctx = {
     console: { ...console, warn() {} }, setTimeout, setInterval, clearTimeout, clearInterval, Promise, Date, Math, JSON,
-    Peer: MockPeer,
+    WebSocket: FakeWS, TextEncoder, TextDecoder,
     window: { addEventListener() {} },
     Spicetify: {
       Player,
@@ -163,9 +154,10 @@ const show = (c, label) => `${label}: ${c.p.uri.slice(-4)} ${c.p.playing ? '▶'
   const q = A.api().room.queue[0];
   check('guest adds a song by link, with metadata', q?.uri === W && q.name === 'Track PBI3' && q.addedBy === 'Bob');
 
+  brokerDown.add('wss://broker.emqx.io:8084/mqtt'); // Cara can only reach the backup relay
   await C.api().start(code);
   await sleep(2500);
-  check('late joiner syncs up', C.p.uri === Z && C.p.playing && close(A, C), show(A, 'A'), show(C, 'C'));
+  check('late joiner syncs up (via backup relay)', C.p.uri === Z && C.p.playing && close(A, C), show(A, 'A'), show(C, 'C'));
 
   await sleep(3500);
   A.player.seek(198500); // host skips to the end of the song
